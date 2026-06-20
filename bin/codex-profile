@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.3.0"
+
+profiles_root="${CODEX_PROFILES_ROOT:-$HOME/.codex-profiles}"
+source_config="${CODEX_PROFILE_SOURCE_CONFIG:-$HOME/.codex}"
+shared_items_default="AGENTS.md prompts skills rules"
+shared_items="${CODEX_PROFILE_SHARED_ITEMS:-$shared_items_default}"
+shortcuts_dir="${CODEX_PROFILE_SHORTCUT_DIR:-$HOME/.local/bin}"
+
+auth_env_names=(
+  OPENAI_API_KEY
+  OPENAI_BASE_URL
+  OPENAI_ORGANIZATION
+  OPENAI_ORG_ID
+  OPENAI_PROJECT
+  CODEX_API_KEY
+  CODEX_ACCESS_TOKEN
+  AZURE_OPENAI_API_KEY
+  AZURE_OPENAI_ENDPOINT
+)
+
+usage() {
+  cat <<'EOF'
+codex-profile - run Codex CLI with isolated local account profiles
+
+Usage:
+  codex-profile <profile> [--] [codex args...]
+  codex-profile --init <profile>
+  codex-profile --path <profile>
+  codex-profile --sync-config <profile>
+  codex-profile --remove <profile>
+  codex-profile --trash-list
+  codex-profile --list
+  codex-profile --doctor
+  codex-profile --help
+
+Examples:
+  codex-profile personal-one
+  codex-profile work
+
+Profiles live under ~/.codex-profiles by default. Each profile gets its own
+CODEX_HOME, credentials, sessions, history, cache, and project state. Stable
+customization is bootstrapped from ~/.codex:
+
+  - config.toml is re-synced from ~/.codex on every launch and stripped of
+    auth-bearing keys and [*.env] tables. Set CODEX_PROFILE_SYNC_CONFIG=0 to keep
+    profile-local edits instead.
+  - AGENTS.md, prompts, skills, and rules are symlinked if they exist.
+
+Each profile launch also creates a shortcut named codex-<profile> in
+~/.local/bin, so after the first run you can start a profile with e.g.
+`codex-work`. Disable with CODEX_PROFILE_SHORTCUTS=0.
+
+For account separation, auth/provider environment variables are always removed
+before Codex starts, so OPENAI_API_KEY and similar variables cannot override the
+profile's own `codex login` session.
+EOF
+}
+
+err() {
+  printf 'codex-profile: %s\n' "$*" >&2
+}
+
+validate_profile() {
+  local profile="$1"
+
+  if [[ -z "$profile" ]]; then
+    err "profile name is required"
+    return 2
+  fi
+
+  if [[ "$profile" == "." || "$profile" == ".." ]]; then
+    err "invalid profile name: $profile"
+    return 2
+  fi
+
+  if [[ ! "$profile" =~ ^[a-z0-9][a-z0-9._-]{0,79}$ ]]; then
+    err "invalid profile name: $profile"
+    err "use 1-80 chars: lowercase letters, numbers, dot, underscore, dash; start with letter/number"
+    return 2
+  fi
+}
+
+profile_path() {
+  local profile="$1"
+  printf '%s/%s\n' "$profiles_root" "$profile"
+}
+
+find_codex_bin() {
+  if [[ -n "${CODEX_PROFILE_CODEX_BIN:-}" ]]; then
+    printf '%s\n' "$CODEX_PROFILE_CODEX_BIN"
+    return 0
+  fi
+
+  command -v codex
+}
+
+write_sanitized_config() {
+  local src="$1"
+  local dst="$2"
+
+  [[ -f "$src" ]] || return 0
+
+  local node_bin
+  node_bin="$(command -v node || true)"
+  if [[ -z "$node_bin" ]]; then
+    # Codex keeps credentials in auth.json (never copied), not config.toml, so a
+    # plain copy is safe even without node available for deeper sanitization.
+    umask 077
+    cp "$src" "$dst"
+    chmod 600 "$dst" 2>/dev/null || true
+    return 0
+  fi
+
+  "$node_bin" - "$src" "$dst" <<'NODE'
+const fs = require("fs");
+
+const [src, dst] = process.argv.slice(2);
+const lines = fs.readFileSync(src, "utf8").split(/\r?\n/);
+
+// Drop whole [*.env] / [env] tables (these are where MCP secrets live) and any
+// key line whose name looks auth-bearing. This mirrors stripping `env` and
+// auth keys from Claude's settings.json.
+const headerRe = /^\s*\[\[?(.+?)\]\]?\s*$/;
+const secretKeyRe =
+  /^\s*["']?[A-Za-z0-9_.\-]*(api[_-]?key|token|secret|password|authorization|bearer|credential)[A-Za-z0-9_.\-]*["']?\s*=/i;
+
+const out = [];
+let skipTable = false;
+
+for (const line of lines) {
+  const header = line.match(headerRe);
+  if (header) {
+    const name = header[1];
+    skipTable = /(^|\.)env$/.test(name.trim());
+    if (!skipTable) out.push(line);
+    continue;
+  }
+  if (skipTable) continue;
+  if (secretKeyRe.test(line)) continue;
+  out.push(line);
+}
+
+fs.writeFileSync(dst, `${out.join("\n").replace(/\n+$/, "")}\n`, { mode: 0o600 });
+NODE
+}
+
+copy_sanitized_config() {
+  local src="$1"
+  local dst="$2"
+
+  [[ ! -e "$dst" ]] || return 0
+  write_sanitized_config "$src" "$dst"
+}
+
+sync_config() {
+  local profile="$1"
+  validate_profile "$profile" || return $?
+
+  local profile_dir
+  profile_dir="$(profile_path "$profile")"
+
+  if [[ ! -d "$profile_dir" ]]; then
+    err "profile does not exist: $profile"
+    err "run: codex-profile --init $profile"
+    return 2
+  fi
+
+  write_sanitized_config "$source_config/config.toml" "$profile_dir/config.toml"
+  printf '%s/config.toml\n' "$profile_dir"
+}
+
+shortcut_path() {
+  printf '%s/codex-%s\n' "$shortcuts_dir" "$1"
+}
+
+write_shortcut() {
+  local profile="$1"
+
+  if [[ "${CODEX_PROFILE_SHORTCUTS:-1}" == "0" ]]; then
+    return 0
+  fi
+
+  case "codex-$profile" in
+    codex-profile|codex-profile-usage|codex-usage)
+      return 0
+      ;;
+  esac
+
+  local shim
+  shim="$(shortcut_path "$profile")"
+
+  if [[ -L "$shim" ]]; then
+    err "refusing to write symlink: $shim"
+    return 0
+  fi
+
+  if [[ -e "$shim" ]] && ! grep -q 'codex-profile shortcut' "$shim" 2>/dev/null; then
+    err "not overwriting existing command: $shim"
+    return 0
+  fi
+
+  mkdir -p "$shortcuts_dir"
+  cat > "$shim" <<EOF
+#!/usr/bin/env bash
+# codex-profile shortcut: $profile (auto-generated; safe to delete)
+exec codex-profile '$profile' "\$@"
+EOF
+  chmod 755 "$shim"
+}
+
+remove_shortcut() {
+  local shim
+  shim="$(shortcut_path "$1")"
+
+  if [[ -f "$shim" ]] && grep -q 'codex-profile shortcut' "$shim" 2>/dev/null; then
+    rm -f "$shim"
+  fi
+}
+
+link_shared_item() {
+  local profile_dir="$1"
+  local name="$2"
+  local src="$source_config/$name"
+  local dst="$profile_dir/$name"
+
+  [[ -e "$src" || -L "$src" ]] || return 0
+
+  if [[ -e "$dst" || -L "$dst" ]]; then
+    return 0
+  fi
+
+  ln -s "$src" "$dst"
+}
+
+init_profile() {
+  local profile="$1"
+  validate_profile "$profile" || return $?
+
+  local profile_dir
+  profile_dir="$(profile_path "$profile")"
+
+  umask 077
+  mkdir -p "$profiles_root" "$profile_dir"
+  chmod 700 "$profiles_root" "$profile_dir" 2>/dev/null || true
+
+  copy_sanitized_config "$source_config/config.toml" "$profile_dir/config.toml"
+
+  local item
+  for item in $shared_items; do
+    link_shared_item "$profile_dir" "$item"
+  done
+
+  write_shortcut "$profile"
+
+  printf '%s\n' "$profile_dir"
+}
+
+list_profiles() {
+  if [[ ! -d "$profiles_root" ]]; then
+    return 0
+  fi
+
+  find "$profiles_root" -mindepth 1 -maxdepth 1 -type d -print \
+    | awk -F/ '{ if ($NF !~ /^\./) print }' \
+    | sed "s#^$profiles_root/##" \
+    | LC_ALL=C sort
+}
+
+remove_profile() {
+  local profile="$1"
+  validate_profile "$profile" || return $?
+
+  local profile_dir trash_dir trash_path timestamp
+  profile_dir="$(profile_path "$profile")"
+
+  if [[ ! -d "$profile_dir" ]]; then
+    err "profile does not exist: $profile"
+    return 2
+  fi
+
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  trash_dir="$profiles_root/.trash"
+  trash_path="$trash_dir/$profile-$timestamp"
+
+  umask 077
+  mkdir -p "$trash_dir"
+  chmod 700 "$trash_dir" 2>/dev/null || true
+  mv "$profile_dir" "$trash_path"
+  remove_shortcut "$profile"
+
+  printf 'moved %s to %s\n' "$profile" "$trash_path"
+}
+
+list_trash() {
+  local trash_dir="$profiles_root/.trash"
+
+  if [[ ! -d "$trash_dir" ]]; then
+    return 0
+  fi
+
+  find "$trash_dir" -mindepth 1 -maxdepth 1 -type d -print \
+    | sed "s#^$trash_dir/##" \
+    | LC_ALL=C sort
+}
+
+strip_auth_env() {
+  local name
+  for name in "${auth_env_names[@]}"; do
+    unset "$name" || true
+  done
+}
+
+set_terminal_title() {
+  local profile="$1"
+
+  if [[ "${CODEX_PROFILE_SET_TERMINAL_TITLE:-1}" == "0" ]]; then
+    return 0
+  fi
+
+  if [[ -t 1 ]]; then
+    local title="${CODEX_PROFILE_TITLE_PREFIX:-codex:}$profile"
+    title="${title//$'\033'/}"
+    title="${title//$'\007'/}"
+    printf '\033]0;%s\007' "$title"
+  fi
+}
+
+doctor() {
+  printf 'codex-profile %s\n' "$VERSION"
+  printf 'profiles root: %s\n' "$profiles_root"
+  printf 'source config: %s\n' "$source_config"
+  printf 'shared items: %s\n' "$shared_items"
+  printf 'shortcuts dir: %s\n' "$shortcuts_dir"
+
+  if [[ "${CODEX_PROFILE_SYNC_CONFIG:-1}" != "0" ]]; then
+    printf 'config sync at launch: enabled\n'
+  else
+    printf 'config sync at launch: disabled (CODEX_PROFILE_SYNC_CONFIG=0)\n'
+  fi
+
+  local codex_bin
+  if codex_bin="$(find_codex_bin 2>/dev/null)"; then
+    printf 'codex binary: %s\n' "$codex_bin"
+    "$codex_bin" --version 2>/dev/null | sed 's/^/codex version: /' || true
+  else
+    printf 'codex binary: not found\n'
+  fi
+
+  local present=()
+  local name
+  for name in "${auth_env_names[@]}"; do
+    if [[ -n "${!name:-}" ]]; then
+      present+=("$name")
+    fi
+  done
+
+  if (( ${#present[@]} )); then
+    printf 'auth env in current shell: present, blocked at launch (%s)\n' "${present[*]}"
+  else
+    printf 'auth env in current shell: none detected\n'
+  fi
+}
+
+main() {
+  local command="${1:-}"
+
+  case "$command" in
+    -h|--help|help)
+      usage
+      return 0
+      ;;
+    --version|version)
+      printf '%s\n' "$VERSION"
+      return 0
+      ;;
+    --list|list)
+      list_profiles
+      return 0
+      ;;
+    --trash-list|trash-list)
+      list_trash
+      return 0
+      ;;
+    --doctor|doctor)
+      doctor
+      return 0
+      ;;
+    --init|init)
+      shift || true
+      init_profile "${1:-}"
+      return 0
+      ;;
+    --path|path)
+      shift || true
+      validate_profile "${1:-}" || return $?
+      profile_path "$1"
+      return 0
+      ;;
+    --sync-config|sync-config)
+      shift || true
+      sync_config "${1:-}"
+      return 0
+      ;;
+    --remove|remove|rm)
+      shift || true
+      remove_profile "${1:-}"
+      return 0
+      ;;
+    "")
+      usage >&2
+      return 2
+      ;;
+    -*)
+      err "unknown option: $command"
+      usage >&2
+      return 2
+      ;;
+  esac
+
+  local profile="$1"
+  shift
+
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+  fi
+
+  local profile_dir
+  profile_dir="$(init_profile "$profile")" || return $?
+
+  if [[ "${CODEX_PROFILE_SYNC_CONFIG:-1}" != "0" ]]; then
+    write_sanitized_config "$source_config/config.toml" "$profile_dir/config.toml"
+  fi
+
+  local codex_bin
+  codex_bin="$(find_codex_bin)" || {
+    err "codex binary not found in PATH"
+    return 127
+  }
+
+  strip_auth_env
+  export CODEX_HOME="$profile_dir"
+  set_terminal_title "$profile"
+
+  set -- "$@" --dangerously-bypass-approvals-and-sandbox
+
+  exec "$codex_bin" "$@"
+}
+
+main "$@"

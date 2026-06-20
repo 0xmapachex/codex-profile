@@ -1,0 +1,37 @@
+{
+  "name": "@0xmapache/codex-profile",
+  "version": "0.1.0",
+  "description": "Secure local multi-profile launcher for the OpenAI Codex CLI.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/0xmapachex/codex-profile.git"
+  },
+  "homepage": "https://github.com/0xmapachex/codex-profile#readme",
+  "bugs": {
+    "url": "https://github.com/0xmapachex/codex-profile/issues"
+  },
+  "bin": {
+    "codex-profile": "bin/codex-profile",
+    "codex-profile-usage": "bin/codex-profile-usage"
+  },
+  "files": [
+    "bin/",
+    "install.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "codex",
+    "codex-cli",
+    "openai",
+    "profiles",
+    "multi-account"
+  ],
+  "scripts": {
+    "test": "bash -n bin/codex-profile bin/codex-profile-usage"
+  }
+}

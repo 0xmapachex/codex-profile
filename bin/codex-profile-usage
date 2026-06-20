@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+profiles_root="${CODEX_PROFILES_ROOT:-$HOME/.codex-profiles}"
+ccusage_package="${CODEX_PROFILE_CCUSAGE_PACKAGE:-ccusage@latest}"
+
+usage() {
+  cat <<'EOF'
+codex-profile-usage - local Codex usage by logged-in codex-profile profiles
+
+Usage:
+  codex-profile-usage [period] [ccusage args...]
+
+Periods:
+  daily      Summarize daily local usage totals per profile (default)
+  monthly    Summarize monthly local usage totals per profile
+  session    Summarize per-session local usage totals per profile
+
+Examples:
+  codex-profile-usage
+  codex-profile-usage monthly
+  codex-profile-usage daily --since 2026-06-01
+
+Notes:
+  - This reports local Codex usage logs, not live subscription quota.
+  - Only profiles where `codex login status` reports a logged-in account are included.
+  - It does not read or print API keys or OAuth tokens.
+EOF
+}
+
+err() {
+  printf 'codex-profile-usage: %s\n' "$*" >&2
+}
+
+find_codex_bin() {
+  if [[ -n "${CODEX_PROFILE_CODEX_BIN:-}" ]]; then
+    printf '%s\n' "$CODEX_PROFILE_CODEX_BIN"
+    return 0
+  fi
+
+  command -v codex
+}
+
+find_profiles() {
+  if [[ ! -d "$profiles_root" ]]; then
+    return 0
+  fi
+
+  find "$profiles_root" -mindepth 1 -maxdepth 1 -type d -print \
+    | awk -F/ '{ if ($NF !~ /^\./) print }' \
+    | LC_ALL=C sort
+}
+
+profile_name_from_path() {
+  local path="$1"
+  basename "$path"
+}
+
+profile_logged_in() {
+  local profile_dir="$1"
+  local codex_bin="$2"
+
+  # codex login status exits 0 when an account is authenticated for this CODEX_HOME.
+  if CODEX_HOME="$profile_dir" "$codex_bin" login status >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Fallback: a populated auth.json means the profile has credentials stored.
+  [[ -s "$profile_dir/auth.json" ]]
+}
+
+run_ccusage_json() {
+  local profile_dir="$1"
+  local period="$2"
+  shift 2
+
+  if command -v ccusage >/dev/null 2>&1; then
+    CODEX_HOME="$profile_dir" ccusage codex "$period" --json --offline "$@"
+  elif command -v npx >/dev/null 2>&1; then
+    CODEX_HOME="$profile_dir" npx -y "$ccusage_package" codex "$period" --json --offline "$@"
+  else
+    err "ccusage or npx is required for usage reports"
+    return 127
+  fi
+}
+
+json_string_array() {
+  node -e 'console.log(JSON.stringify(process.argv.slice(1)))' "$@"
+}
+
+main() {
+  local period="${1:-daily}"
+
+  case "$period" in
+    -h|--help|help)
+      usage
+      return 0
+      ;;
+    daily|monthly|session)
+      shift || true
+      ;;
+    *)
+      err "invalid period: $period"
+      usage >&2
+      return 2
+      ;;
+  esac
+
+  local codex_bin
+  codex_bin="$(find_codex_bin)" || {
+    err "codex binary not found in PATH"
+    return 127
+  }
+
+  local rows_file
+  rows_file="$(mktemp "${TMPDIR:-/tmp}/codex-usage-rows.XXXXXX")"
+  trap "rm -f '$rows_file'" EXIT
+  printf '[]' > "$rows_file"
+
+  local profile_dir profile status ccusage_json args_json
+  args_json="$(json_string_array "$@")"
+
+  while IFS= read -r profile_dir; do
+    [[ -n "$profile_dir" ]] || continue
+    profile="$(profile_name_from_path "$profile_dir")"
+
+    if ! profile_logged_in "$profile_dir" "$codex_bin"; then
+      continue
+    fi
+
+    if ccusage_json="$(run_ccusage_json "$profile_dir" "$period" "$@" 2>/dev/null)"; then
+      status="ok"
+    else
+      status="usage-unavailable"
+      ccusage_json='{}'
+    fi
+
+    CCUSAGE_JSON="$ccusage_json" node - "$rows_file" "$profile" "$profile_dir" "$period" "$status" "$args_json" <<'NODE'
+const fs = require("fs");
+
+const [rowsPath, profile, profileDir, period, status, argsJson] = process.argv.slice(2);
+const args = JSON.parse(argsJson);
+let ccusage = {};
+const raw = process.env.CCUSAGE_JSON ?? "";
+
+if (raw.trim()) {
+  try {
+    ccusage = JSON.parse(raw);
+  } catch {
+    ccusage = {};
+  }
+}
+
+const totals = ccusage.totals ?? {};
+const list = ccusage[period] ?? [];
+const latest = Array.isArray(list) && list.length > 0 ? list[list.length - 1] : null;
+
+const row = {
+  profile,
+  profileDir,
+  status,
+  periods: Array.isArray(list) ? list.length : 0,
+  totalTokens: Number(totals.totalTokens ?? 0),
+  inputTokens: Number(totals.inputTokens ?? 0),
+  outputTokens: Number(totals.outputTokens ?? 0),
+  cacheCreationTokens: Number(totals.cacheCreationTokens ?? 0),
+  cacheReadTokens: Number(totals.cacheReadTokens ?? 0),
+  reasoningOutputTokens: Number(totals.reasoningOutputTokens ?? 0),
+  totalCost: Number(totals.costUSD ?? totals.totalCost ?? 0),
+  latestPeriod: latest?.date ?? latest?.sessionId ?? latest?.period ?? "",
+  latestTokens: Number(latest?.totalTokens ?? 0),
+  args
+};
+
+const rows = JSON.parse(fs.readFileSync(rowsPath, "utf8"));
+rows.push(row);
+fs.writeFileSync(rowsPath, JSON.stringify(rows));
+NODE
+  done < <(find_profiles)
+
+  node - "$rows_file" "$period" <<'NODE'
+const fs = require("fs");
+
+const [rowsPath, period] = process.argv.slice(2);
+const rows = JSON.parse(fs.readFileSync(rowsPath, "utf8"));
+
+function fmtInt(value) {
+  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value);
+}
+
+function fmtMoney(value) {
+  return `$${new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  }).format(value)}`;
+}
+
+if (rows.length === 0) {
+  console.log("No logged-in codex-profile profiles found.");
+  console.log("Run `codex-profile <name>` and use `codex login` inside the profile first.");
+  process.exit(0);
+}
+
+const table = rows.map(row => ({
+  Profile: row.profile,
+  Status: row.status,
+  [`${period} periods`]: row.periods,
+  "Total tokens": fmtInt(row.totalTokens),
+  "Input": fmtInt(row.inputTokens),
+  "Output": fmtInt(row.outputTokens),
+  "Reasoning": fmtInt(row.reasoningOutputTokens),
+  "Cache write": fmtInt(row.cacheCreationTokens),
+  "Cache read": fmtInt(row.cacheReadTokens),
+  "Est. cost": fmtMoney(row.totalCost),
+  "Latest": row.latestPeriod || "-"
+}));
+
+console.table(table);
+console.log("Source: local Codex logs via ccusage. This is not live subscription quota.");
+NODE
+}
+
+main "$@"
